@@ -464,6 +464,9 @@ for (( counter = 1; counter <= count; counter++ )); do
         sudo rm -f "$policy_file"
     fi
 
+    # Wait for xenvif reboot prompt, otherwise it might happen after reboot
+    qvm-run -q "$qube" "start /wait wscript e:\\wait-for-reboot-prompt.vbs" || true
+
     echo_info "Shutting down Windows..."
     # Shutdown and wait until complete before finishing or starting next installation
     qvm-shutdown --wait "$qube"
