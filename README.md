@@ -70,6 +70,10 @@ Usage: qvm-create-windows-qube [options] -i <iso> -a <answer file> <name>
   -P, --pool <name> LVM storage pool to install Windows on (https://www.qubes-os.org/doc/secondary-storage/)
   -i, --iso <file> Windows media to automatically install and setup
   -a, --answer-file <xml file> Settings for Windows installation
+  -d, --disk-size <size> Specify system disk size, in GiB; default: 30
+  --mem <size> Specify initial memory, in MiB; default: 2048
+  --vcpu <number> Specify number of virtual CPUs; default: 2
+  --priv <size> Specify private disk size, in GiB; default: 10
 ```
 
 ### Downloading Windows ISO

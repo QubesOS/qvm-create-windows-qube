@@ -84,6 +84,9 @@ usage() {
     echo "  -i, --iso <file> Windows media to automatically install and setup"
     echo "  -a, --answer-file <xml file> Settings for Windows installation"
     echo "  -d, --disk-size <size> Specify system disk size, in GiB; default: 30"
+    echo "  --mem <size> Specify initial memory, in MiB; default: 2048"
+    echo "  --vcpu <number> Specify number of virtual CPUs; default: 2"
+    echo "  --priv <size> Specify private disk size, in GiB; default: 10"
 
     if is_dom0; then
         echo ""
@@ -95,7 +98,7 @@ usage() {
 
 # Option strings
 short="hc:tn:soywp:P:i:a:d:"
-long="help,count:,template,netvm:,seamless,optimize,spyless,whonix,packages:,pool:,iso:,answer-file:,disk-size:"
+long="help,count:,template,netvm:,seamless,optimize,spyless,whonix,packages:,pool:,iso:,answer-file:,disk-size:,mem:,vcpu:,priv:"
 
 # Read options
 if ! opts=$(getopt --options=$short --longoptions=$long --name "$0" -- "$@"); then
@@ -106,6 +109,9 @@ eval set -- "$opts"
 # Set defaults
 count="1"
 disk_size="30"
+private_size="10"
+memory="2048"
+vcpus="2"
 
 # Put options into variables
 while true; do
@@ -159,6 +165,30 @@ while true; do
                 exit 1
             fi
             disk_size="$2"
+            shift
+            ;;
+        --mem)
+            if ! [ "$2" -gt 0 ] 2>/dev/null; then
+                echo_err "Memory must be a positive number (MiB), without suffix"
+                exit 1
+            fi
+            memory="$2"
+            shift
+            ;;
+        --vcpu)
+            if ! [ "$2" -gt 0 ] 2>/dev/null; then
+                echo_err "vCPUs must be a positive number"
+                exit 1
+            fi
+            vcpus="$2"
+            shift
+            ;;
+        --priv)
+            if ! [ "$2" -gt 0 ] 2>/dev/null; then
+                echo_err "Private disk size must be a positive number, without suffix"
+                exit 1
+            fi
+            private_size="$2"
             shift
             ;;
         --)
@@ -315,13 +345,14 @@ for (( counter = 1; counter <= count; counter++ )); do
     echo_info "Starting creation of $qube"
     qvm-create --class "$class" --label red "$qube" -P "$pool"
     qvm-prefs "$qube" virt_mode hvm
-    qvm-prefs "$qube" memory 2048 # Minimum starting with newer versions of Windows 10
+    qvm-prefs "$qube" memory "$memory" # Default: 2048 MiB (minimum for newer versions of Windows 10)
     qvm-prefs "$qube" maxmem 0 # Disable currently unstable Qubes memory manager
     qvm-prefs "$qube" kernel ""
+    qvm-prefs "$qube" vcpus "$vcpus" # Default: 2
     qvm-prefs "$qube" qrexec_timeout 999999 # Windows startup can take longer, especially if a chkdsk is performed. Also, to account for the duration of a Windows update
     qvm-features "$qube" video-model cirrus
     qvm-volume extend "$qube:root" "$disk_size"GiB
-    qvm-volume extend "$qube:private" 10GiB # Minimum starting with newer versions of Windows 10
+    qvm-volume extend "$qube:private" "$private_size"GiB # Default: 10 GiB (minimum for newer versions of Windows 10)
     qvm-prefs "$qube" netvm ""
 
     echo_info "Starting first part of Windows installation process..."
