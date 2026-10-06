@@ -187,7 +187,7 @@ qubes_version="$(awk -F"[()]" '{ print $2 }' /etc/qubes-release)"
 case "$qubes_version" in
     "R4.0")
         ;;
-    "R4.1" | "R4.2" | "R4.3")
+    "R4.1" | "R4.2" | "R4.3" | "Rdevel" )
         if ! [ -f "/usr/lib/qubes/qubes-windows-tools.iso" ]; then
             echo_err "Qubes version $qubes_version is supported. However, Qubes OS does not currently offer an official build of Qubes Windows Tools for $qubes_version. To continue, please build Qubes Windows Tools yourself and place it at: /usr/lib/qubes/qubes-windows-tools.iso"
             exit 1
@@ -369,7 +369,7 @@ for (( counter = 1; counter <= count; counter++ )); do
 
     if [ "$(qvm-features "$qube" os)" != "Windows" ]; then
         echo_info "Completing setup of Qubes Windows Tools..."
-        until qvm-start "$qube"; do
+        until qvm-start --cdrom "$resources_qube:$resources_dir/tools/auto-qwt.iso" "$qube"; do
             echo_err "Failed to start $qube! Not enough memory? Retrying in 10 seconds..."
             sleep 10
         done
