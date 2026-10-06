@@ -138,9 +138,14 @@
             </OOBE>
             <FirstLogonCommands>
                 <SynchronousCommand wcm:action="add">
+                   <CommandLine>reg add "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v StartShownOnUpgrade /t REG_DWORD /d 1 /f</CommandLine>
+                   <Description>Disable auto-opening Start Menu after install</Description>
+                   <Order>1</Order>
+                </SynchronousCommand>
+                <SynchronousCommand wcm:action="add">
                     <CommandLine>D:\run.bat</CommandLine>
                     <Description>Start QWT installation</Description>
-                    <Order>1</Order>
+                    <Order>2</Order>
                     <RequiresUserInput>true</RequiresUserInput>
                 </SynchronousCommand>
             </FirstLogonCommands>
