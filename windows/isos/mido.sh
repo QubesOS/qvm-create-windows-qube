@@ -30,6 +30,55 @@ format() { fold -s; }
 
 word_count() { echo $#; }
 
+# HTTP client selection
+#
+# Microsoft gates its download APIs behind "Sentinel" bot detection which keys on the TLS and
+# HTTP fingerprint of the client. A stock curl build is easy to tell apart from a real web browser
+# so downloads may be rejected (especially from VPN, datacenter, or Tor IP addresses).
+# curl-impersonate is a curl build that presents the fingerprint of a real web browser; when one of
+# its command line variants is installed it is used automatically. The actively maintained fork is
+# https://github.com/lexiforest/curl-impersonate (successor to https://github.com/lwthiker/curl-impersonate).
+# Newest Chrome variants are preferred (a current browser fingerprint is the least suspicious);
+# other variants (curl_firefox*, curl_safari*, curl_edge*, curl_tor*) and arbitrary paths work too
+# via the MIDO_CURL environment variable, e.g. MIDO_CURL=/path/to/curl_tor145 or MIDO_CURL=curl
+# (the latter forces the stock curl build).
+user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:100.0) Gecko/20100101 Firefox/100.0"
+curl_bin="curl"
+curl_impersonate=""
+if [ "$MIDO_CURL" ]; then
+    curl_bin="$MIDO_CURL"
+else
+    for curl_variant in curl_chrome150 curl_chrome146 curl_chrome145 curl_chrome142 curl_chrome136 curl_chrome133a curl_chrome131 curl_chrome124 curl_chrome120 curl_chrome123 curl_chrome119 curl_chrome116 curl_chrome110 curl_chrome107 curl_chrome104 curl_chrome101 curl_chrome100 curl-impersonate-chrome curl-impersonate; do
+        if command -v "$curl_variant" > /dev/null 2>&1; then
+            curl_bin="$curl_variant"
+            break
+        fi
+    done
+fi
+# Impersonating builds pin their own browser TLS/HTTP versions, so Mido must not override them
+if [ "$curl_bin" != "curl" ] && "$curl_bin" --version 2> /dev/null | grep -Eq "IMPERSONATE|BoringSSL"; then
+    curl_impersonate="true"
+fi
+[ "$VERBOSE" ] && echo "HTTP client: $curl_bin (browser impersonation: ${curl_impersonate:-no})" >&2
+
+# Wrapper around the selected curl binary
+# In impersonate mode the binary's own browser identity is used; otherwise Mido's user agent is sent
+cURL() {
+    if [ "$curl_impersonate" ]; then
+        "$curl_bin" "$@"
+    else
+        "$curl_bin" --user-agent "$user_agent" "$@"
+    fi
+}
+
+# TLS/HTTP version flags for the non-impersonating requests Mido makes
+# (In impersonate mode these stay empty so the browser fingerprint is preserved)
+if [ "$curl_impersonate" ]; then
+    curl_browser_flags=""
+else
+    curl_browser_flags="--tlsv1.2 --http1.1"
+fi
+
 usage() {
     echo "Mido - The Secure Microsoft Windows Downloader"
     echo ""
@@ -67,6 +116,10 @@ usage() {
     echo "Privacy Preserving Technologies"
     echo "-------------------------------"
     echo "The aforementioned Microsoft gated download web interface is currently blocking Tor (and similar technologies). They say this is to prevent people in restricted regions from downloading certain Windows media they shouldn't have access to. This is fine by most standards because Tor is too slow for large downloads anyway and we have checksum verification for security." | format
+    echo ""
+    echo "Web Browser Impersonation"
+    echo "-------------------------"
+    echo "Microsoft's download APIs only answer clients whose TLS and HTTP fingerprint looks like a real web browser. Mido automatically uses an installed curl-impersonate binary (e.g. curl_chrome150, curl_chrome116 or curl-impersonate-chrome) if one is found in PATH and falls back to the regular curl otherwise. Set the MIDO_CURL environment variable to choose a specific curl binary (e.g. MIDO_CURL=curl forces the regular curl)." | format
     echo ""
     echo "Language"
     echo "--------"
@@ -239,9 +292,16 @@ scurl_file() {
 
     part_file="${out_file}${part_ext}"
 
+    # In web browser impersonate mode the curl binary pins its own browser-like TLS and HTTP versions
+    if [ "$curl_impersonate" ]; then
+        tls_flags=""
+    else
+        tls_flags="--tlsv$tls_version --http1.1"
+    fi
+
     # --location: Microsoft likes to change which endpoint these downloads are stored on but is usually kind enough to add redirects
     # --fail: Return an error on server errors where the HTTP response code is 400 or greater
-    curl --progress-bar --location --output "$part_file" --continue-at - --max-filesize 10G --fail --proto =https "--tlsv$tls_version" --http1.1 -- "$url" || {
+    cURL --progress-bar --location --output "$part_file" --continue-at - --max-filesize 10G --fail --proto =https $tls_flags -- "$url" || {
         error_code=$?
         handle_curl_error "$error_code"
         error_action=$?
@@ -310,6 +370,10 @@ consumer_download() {
     # https://github.com/ElliotKillick/Mido
 
     # Download newer consumer Windows versions from behind gated Microsoft API
+    #
+    # In November 2024 Microsoft replaced the HTML "contentinclude" API with a JSON "software-download-connector" API,
+    # and in early 2026 added an "ov-df" challenge that every session must complete before a download link is issued.
+    # See: https://github.com/quickemu-project/quickemu/issues/1528 and https://github.com/pbatard/Fido/issues/98
 
     out_file="$1"
     # Either 8, 10, or 11
@@ -320,7 +384,6 @@ consumer_download() {
         8 | 10) url="${url}ISO" ;;
     esac
 
-    user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:100.0) Gecko/20100101 Firefox/100.0"
     # uuidgen: For MacOS (installed by default) and other systems (e.g. with no /proc) that don't have a kernel interface for generating random UUIDs
     session_id="$(cat /proc/sys/kernel/random/uuid 2> /dev/null || uuidgen --random)"
 
@@ -329,7 +392,7 @@ consumer_download() {
     # This is a request we make that Fido doesn't. Fido manually maintains a list of all the Windows release/edition product edition IDs in its script (see: $WindowsVersions array). This is helpful for downloading older releases (e.g. Windows 10 1909, 21H1, etc.) but we always want to get the newest release which is why we get this value dynamically
     # Also, keeping a "$WindowsVersions" array like Fido does would be way too much of a maintenance burden
     # Remove "Accept" header that curl sends by default (match Fido requests)
-    iso_download_page_html="$(curl --user-agent "$user_agent" --header "Accept:" --max-filesize 1M --fail --proto =https --tlsv1.2 --http1.1 -- "$url")" || {
+    iso_download_page_html="$(cURL --header "Accept:" --max-filesize 1M --fail --proto =https $curl_browser_flags -- "$url")" || {
         handle_curl_error $?
         return $?
     }
@@ -341,58 +404,130 @@ consumer_download() {
 
     # Permit Session ID
     # "org_id" is always the same value
-    curl --output /dev/null --user-agent "$user_agent" --header "Accept:" --max-filesize 100K --fail --proto =https --tlsv1.2 --http1.1 -- "https://vlscppe.microsoft.com/tags?org_id=y6jn8c31&session_id=$session_id" || {
+    cURL --output /dev/null --header "Accept:" --max-filesize 100K --fail --proto =https $curl_browser_flags -- "https://vlscppe.microsoft.com/tags?org_id=y6jn8c31&session_id=$session_id" || {
         # This should only happen if there's been some change to how this API works
         handle_curl_error $?
         return $?
     }
 
-    # Extract everything after the last slash
-    url_segment_parameter="${url##*/}"
-
-    # Get language -> skuID association table
-    # SKU ID: This specifies the language of the ISO. We always use "English (United States)", however, the SKU for this changes with each Windows release
-    # We must make this request so our next one will be allowed
-    # --data "" is required otherwise no "Content-Length" header will be sent causing HTTP response "411 Length Required"
-    language_skuid_table_html="$(curl --request POST --user-agent "$user_agent" --data "" --header "Accept:" --max-filesize 10K --fail --proto =https --tlsv1.2 --http1.1 -- "https://www.microsoft.com/en-US/api/controls/contentinclude/html?pageId=a8f8f489-4c7f-463a-9ca6-5cff94d8d041&host=www.microsoft.com&segments=software-download,$url_segment_parameter&query=&action=getskuinformationbyproductedition&sessionId=$session_id&productEditionId=$product_edition_id&sdVersion=2")" || {
+    # Complete the "ov-df" challenge
+    # The download page loads a script from ov-df.microsoft.com that hands out a token ("w") and a server timestamp ("rticks"),
+    # then loads a hidden iframe that sends both back together with the browser's current time ("mdt", milliseconds since the Unix epoch)
+    # Without this the session is flagged and the final download link request is rejected by Microsoft's "Sentinel" (HTTP 200 with an "ErrorSettings.SentinelReject" JSON body)
+    # "instanceId"/"CustomerId" is a constant embedded in the download page's script (same value Fido uses)
+    ov_df_instance_id="560dc9f3-1aa5-4a2f-b63c-9e18f8d0e175"
+    ov_df_js="$(cURL --header "Accept:" --max-filesize 100K --fail --proto =https $curl_browser_flags -- "https://ov-df.microsoft.com/mdt.js?instanceId=$ov_df_instance_id&PageId=si&session_id=$session_id")" || {
+        # This should only happen if there's been some change to how this API works
         handle_curl_error $?
         return $?
     }
 
-    # tr: Filter for only alphanumerics or "-" to prevent HTTP parameter injection
-    sku_id="$(echo "$language_skuid_table_html" | grep "English (United States)" | sed 's/&quot;//g' | cut -d ',' -f 1  | cut -d ':' -f 2 | tr -cd '[:alnum:]-' | head -c 16)"
+    # tr: Filter for only hexadecimal digits (token) or numerics (timestamp) to prevent HTTP parameter injection
+    ov_df_token="$(printf '%s\n' "$ov_df_js" | grep -o '[?&]w=[A-Fa-f0-9]*' | head -n 1 | cut -d '=' -f 2 | tr -cd '[:xdigit:]' | head -c 64)"
+    ov_df_ticks="$(printf '%s\n' "$ov_df_js" | grep -o 'rticks="+\{0,1\}[0-9]*' | head -n 1 | tr -cd '0-9' | head -c 32)"
+    [ "$VERBOSE" ] && echo "ov-df token: $ov_df_token, ticks: $ov_df_ticks" >&2
+
+    if ! [ "$ov_df_token" ] || ! [ "$ov_df_ticks" ]; then
+        # This should only happen if there's been some change to how this API works
+        echo_err "Microsoft servers gave us no ov-df challenge data. Please manually download this ISO in a web browser: $url"
+        manual_verification="true"
+        return 1
+    fi
+
+    # Current time in milliseconds since the Unix epoch (what "Date.now()" returns in the browser)
+    # %N is a GNU extension; fall back to whole seconds where it's unsupported (e.g. MacOS)
+    ov_df_time="$(date +%s%3N 2> /dev/null)"
+    case "$ov_df_time" in
+        "" | *[!0-9]*) sleep 1; ov_df_time="$(( $(date +%s) * 1000 ))" ;;
+    esac
+
+    cURL --output /dev/null --header "Accept:" --max-filesize 100K --fail --proto =https $curl_browser_flags -- "https://ov-df.microsoft.com/?session_id=$session_id&CustomerId=$ov_df_instance_id&PageId=si&w=$ov_df_token&mdt=$ov_df_time&rticks=$ov_df_ticks" || {
+        # This should only happen if there's been some change to how this API works
+        handle_curl_error $?
+        return $?
+    }
+
+    # "profile" is a constant the download page's script sends with every software-download-connector API request (same value Fido uses)
+    profile_id="606624d44113"
+
+    # Get language -> SKU ID association table
+    # SKU ID: This specifies the language of the ISO. We always use "English (United States)", however, the SKU for this changes with each Windows release
+    # We must make this request so our next one will be allowed
+    # Microsoft sometimes answers a freshly created session with an error, so make a few attempts (Fido does the same)
+    sku_id=""
+    attempt=0
+    while [ "$attempt" -lt 3 ]; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -gt 1 ] && sleep 2
+
+        language_skuid_table_json="$(cURL --referer "$url" --header "Accept:" --max-filesize 100K --fail --proto =https $curl_browser_flags -- "https://www.microsoft.com/software-download-connector/api/getskuinformationbyproductedition?profile=$profile_id&ProductEditionId=$product_edition_id&SKU=undefined&friendlyFileName=undefined&Locale=en-US&sessionID=$session_id")" || {
+            handle_curl_error $?
+            return $?
+        }
+
+        # Minimal JSON parsing without a jq dependency: put every "Skus" array element on its own line, pick the "English (United States)" one, and extract its "Id"
+        # Fall back to the language-neutral "Language" field in case Microsoft renames the localized one
+        # tr: Filter for only alphanumerics or "-" to prevent HTTP parameter injection
+        sku_id="$(printf '%s\n' "$language_skuid_table_json" | tr '{' '\n' | grep -F '"LocalizedLanguage":"English (United States)"' | head -n 1 | sed -n 's/.*"Id":"\{0,1\}\([[:alnum:]-]*\).*/\1/p' | tr -cd '[:alnum:]-' | head -c 16)"
+        if ! [ "$sku_id" ]; then
+            sku_id="$(printf '%s\n' "$language_skuid_table_json" | tr '{' '\n' | grep -F '"Language":"English"' | head -n 1 | sed -n 's/.*"Id":"\{0,1\}\([[:alnum:]-]*\).*/\1/p' | tr -cd '[:alnum:]-' | head -c 16)"
+        fi
+
+        [ "$sku_id" ] && break
+    done
     [ "$VERBOSE" ] && echo "SKU ID: $sku_id" >&2
+
+    if ! [ "$sku_id" ]; then
+        # This should only happen if there's been some change to how this API works
+        echo_err "Microsoft servers gave us no SKU ID for English (United States). Please manually download this ISO in a web browser: $url"
+        [ "$VERBOSE" ] && echo "Response: $(printf '%s' "$language_skuid_table_json" | head -c 512)" >&2
+        manual_verification="true"
+        return 1
+    fi
 
     # Get ISO download link
     # If any request is going to be blocked by Microsoft it's always this last one (the previous requests always seem to succeed)
     # --referer: Required by Microsoft servers to allow request
-    iso_download_link_html="$(curl --request POST --user-agent "$user_agent" --data "" --referer "$url" --header "Accept:" --max-filesize 100K --fail --proto =https --tlsv1.2 --http1.1 -- "https://www.microsoft.com/en-US/api/controls/contentinclude/html?pageId=6e2a1789-ef16-4f27-a296-74ef7ef5d96b&host=www.microsoft.com&segments=software-download,$url_segment_parameter&query=&action=GetProductDownloadLinksBySku&sessionId=$session_id&skuId=$sku_id&language=English&sdVersion=2")" || {
+    iso_download_link_json="$(cURL --referer "$url" --header "Accept:" --max-filesize 100K --fail --proto =https $curl_browser_flags -- "https://www.microsoft.com/software-download-connector/api/GetProductDownloadLinksBySku?profile=$profile_id&productEditionId=undefined&SKU=$sku_id&friendlyFileName=undefined&Locale=en-US&sessionID=$session_id")" || {
         # This should only happen if there's been some change to how this API works
         handle_curl_error $?
         return $?
     }
 
-    if ! [ "$iso_download_link_html" ]; then
+    if ! [ "$iso_download_link_json" ]; then
         # This should only happen if there's been some change to how this API works
         echo_err "Microsoft servers gave us an empty response to our request for an automated download. Please manually download this ISO in a web browser: $url"
         manual_verification="true"
         return 1
     fi
 
-    if echo "$iso_download_link_html" | grep -q "We are unable to complete your request at this time."; then
-        echo_err "Microsoft blocked the automated download request based on your IP address. Please manually download this ISO in a web browser here: $url"
+    # Microsoft answers HTTP 200 with a JSON error body when it refuses to issue a link (a successful answer has an empty "Errors" array)
+    if printf '%s\n' "$iso_download_link_json" | grep -Fq '"Errors":[{'; then
+        # tr: Filter for only alphanumerics, punctuation, or spaces so the server can't print terminal escape sequences
+        error_message="$(printf '%s\n' "$iso_download_link_json" | sed -n 's/.*"Value":"\([^"]*\)".*/\1/p' | head -n 1 | tr -cd '[:alnum:][:punct:] ' | head -c 256)"
+        if printf '%s\n' "$iso_download_link_json" | grep -Fq "SentinelReject"; then
+            echo_err "Microsoft blocked the automated download request ($error_message). This is either an IP address ban (too many requests, or a VPN/datacenter/Tor address) or Microsoft's \"Sentinel\" not accepting this session's web browser fingerprint. Please manually download this ISO in a web browser here: $url"
+        else
+            echo_err "Microsoft servers refused our request for an automated download ($error_message). Please manually download this ISO in a web browser here: $url"
+        fi
         manual_verification="true"
         return 1
     fi
 
     # Filter for 64-bit ISO download URL
-    # sed: HTML decode "&" character
+    # Minimal JSON parsing without a jq dependency: put every "ProductDownloadOptions" array element on its own line, pick the x64 one ("DownloadType" 1 = x64 according to Fido, fall back to "x64" in the file name), and extract its "Uri"
+    iso_download_link="$(printf '%s\n' "$iso_download_link_json" | tr '{' '\n' | grep -E '"DownloadType": *"?1[,}"]' | head -n 1 | sed -n 's/.*"Uri":"\([^"]*\)".*/\1/p')"
+    if ! [ "$iso_download_link" ]; then
+        iso_download_link="$(printf '%s\n' "$iso_download_link_json" | tr '{' '\n' | grep -i 'x64' | sed -n 's/.*"Uri":"\([^"]*\)".*/\1/p' | head -n 1)"
+    fi
+    # sed: JSON decode "&" and "/" characters
     # tr: Filter for only alphanumerics or punctuation
-    iso_download_link="$(echo "$iso_download_link_html" | grep -o "https://software.download.prss.microsoft.com.*IsoX64" | cut -d '"' -f 1 | sed 's/&amp;/\&/g' | tr -cd '[:alnum:][:punct:]' | head -c 512)"
+    iso_download_link="$(printf '%s\n' "$iso_download_link" | sed 's/\\u0026/\&/g; s@\\/@/@g' | tr -cd '[:alnum:][:punct:]' | head -c 1024)"
 
     if ! [ "$iso_download_link" ]; then
         # This should only happen if there's been some change to the download endpoint web address
         echo_err "Microsoft servers gave us no download link to our request for an automated download. Please manually download this ISO in a web browser: $url"
+        [ "$VERBOSE" ] && echo "Response: $(printf '%s' "$iso_download_link_json" | head -c 512)" >&2
         manual_verification="true"
         return 1
     fi
@@ -418,7 +553,7 @@ enterprise_eval_download() {
 
     url="https://www.microsoft.com/en-us/evalcenter/download-$windows_version"
 
-    iso_download_page_html="$(curl --location --max-filesize 1M --fail --proto =https --tlsv1.2 --http1.1 -- "$url")" || {
+    iso_download_page_html="$(cURL --location --max-filesize 1M --fail --proto =https $curl_browser_flags -- "$url")" || {
         handle_curl_error $?
         return $?
     }
@@ -429,27 +564,53 @@ enterprise_eval_download() {
         return 1
     fi
 
-    iso_download_links="$(echo "$iso_download_page_html" | grep -o "https://go.microsoft.com/fwlink/p/?LinkID=[0-9]\+&clcid=0x[0-9a-z]\+&culture=en-us&country=US")" || {
+    # Current evalcenter pages pair each download anchor with a descriptive aria-label
+    # (e.g. 'Download Windows 11 Enterprise ISO 64-bit (en-US)') which is far more reliable than
+    # counting links in page order (the download buttons for every language are now all on one page).
+    # Extract each anchor's aria-label together with the href of its own tag: the match must not be
+    # able to cross a tag boundary ("[^>]*") or a label could be paired with another anchor's link.
+    labeled_download_anchors="$(printf '%s' "$iso_download_page_html" | grep -o 'aria-label="[^"]*"[^>]*href="https://go\.microsoft\.com/fwlink/[^"]*"' | head -n 64)"
+
+    iso_download_link=""
+    case "$enterprise_type" in
+        # Select x64 en-US ISO download link, skipping any LTSC entry ("ISO 64-bit (en-US)" doesn't match the LTSC label)
+        "enterprise" | "server")
+            iso_download_link="$(printf '%s\n' "$labeled_download_anchors" | grep -F 'ISO 64-bit (en-US)' | sed -n 's/.*href="\([^"]*\)".*/\1/p' | head -n 1 | tr -cd '[:alnum:][:punct:]' | head -c 1024)"
+            ;;
+        # Select x64 en-US LTSC ISO download link
+        "ltsc")
+            iso_download_link="$(printf '%s\n' "$labeled_download_anchors" | grep -F 'LTSC' | grep -F '(en-US)' | sed -n 's/.*href="\([^"]*\)".*/\1/p' | head -n 1 | tr -cd '[:alnum:][:punct:]' | head -c 1024)"
+            ;;
+    esac
+
+    if ! [ "$iso_download_link" ]; then
+        # Fall back to the legacy page format: bare fwlinks in download order (the en-US x64 ISO
+        # used to be the 2nd link for "enterprise", the 4th for "ltsc", and the only link for "server")
+        iso_download_links="$(printf '%s' "$iso_download_page_html" | grep -o "https://go.microsoft.com/fwlink/p/?LinkID=[0-9]\+&clcid=0x[0-9a-z]\+&culture=en-us&country=US")"
+
+        # Limit untrusted size for input validation
+        iso_download_links="$(echo "$iso_download_links" | head -c 1024)"
+
+        case "$enterprise_type" in
+            # Select x64 download link
+            "enterprise") iso_download_link=$(echo "$iso_download_links" | head -n 2 | tail -n 1) ;;
+            # Select x64 LTSC download link
+            "ltsc") iso_download_link=$(echo "$iso_download_links" | head -n 4 | tail -n 1) ;;
+            *) iso_download_link="$iso_download_links" ;;
+        esac
+    fi
+
+    if ! [ "$iso_download_link" ]; then
         # This should only happen if there's been some change to the download endpoint web address
+        # (or Microsoft has retired the download, as they have for the Windows 10 Enterprise evaluations)
         echo_err "Windows enterprise evaluation download page gave us no download link"
         return 1
-    }
-
-    # Limit untrusted size for input validation
-    iso_download_links="$(echo "$iso_download_links" | head -c 1024)"
-
-    case "$enterprise_type" in
-        # Select x64 download link
-        "enterprise") iso_download_link=$(echo "$iso_download_links" | head -n 2 | tail -n 1) ;;
-        # Select x64 LTSC download link
-        "ltsc") iso_download_link=$(echo "$iso_download_links" | head -n 4 | tail -n 1) ;;
-        *) iso_download_link="$iso_download_links" ;;
-    esac
+    fi
 
     # Follow redirect so proceeding log message is useful
     # This is a request we make this Fido doesn't
     # We don't need to set "--max-filesize" here because this is a HEAD request and the output is to /dev/null anyway
-    iso_download_link="$(curl --location --output /dev/null --silent --write-out "%{url_effective}" --head --fail --proto =https --tlsv1.2 --http1.1 -- "$iso_download_link")" || {
+    iso_download_link="$(cURL --location --output /dev/null --silent --write-out "%{url_effective}" --head --fail --proto =https $curl_browser_flags -- "$iso_download_link")" || {
         # This should only happen if the Microsoft servers are down
         handle_curl_error $?
         return $?
@@ -518,6 +679,7 @@ download_media() {
                 ;;
             "$win10x64_enterprise_eval")
                 echo_info "Downloading Windows 10 Enterprise Evaluation..."
+                # Microsoft has retired the Windows 10 Enterprise evaluation download: the evalcenter page now redirects to a blog post, so this download can no longer be automated from Microsoft servers
                 enterprise_eval_download "$media" windows-10-enterprise enterprise
                 ;;
             "$win11x64_enterprise_eval")
@@ -526,6 +688,7 @@ download_media() {
                 ;;
             "$win10x64_enterprise_ltsc_eval")
                 echo_info "Downloading Windows 10 Enterprise LTSC Evaluation..."
+                # Microsoft has retired the Windows 10 Enterprise LTSC evaluation download along with the regular Windows 10 Enterprise evaluation (see above)
                 enterprise_eval_download "$media" windows-10-enterprise ltsc
                 ;;
 
